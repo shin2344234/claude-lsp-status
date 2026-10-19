@@ -40,7 +40,15 @@ export type Report = {
   rows: Row[]
   /** File types that look like code with no server and no entry in the language table, most files first. */
   unplaced: [string, number][]
+  /** Each MCP server asked for its `lsp_status`, and what came of it. */
+  mcp: McpCheck[]
 }
+
+/**
+ * One MCP server's `lsp_status` answer: how many language servers it reported, or why this scan's
+ * call failed. `savedAt` is when the answer it fell back to arrived, when it had one.
+ */
+export type McpCheck = { server: string; servers: number; problem?: string; savedAt?: number }
 
 /** The answer the last Test press got from a language's server. */
 export type Probe = { state: 'running' | 'ok' | 'failed'; text: string }

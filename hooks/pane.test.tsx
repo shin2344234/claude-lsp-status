@@ -20,6 +20,8 @@ type World = {
   dirs?: Record<string, { name: string; kind: 'file' | 'dir' }[]>
   /** Commands `where` finds, besides csharp-ls. */
   found?: Record<string, string>
+  /** Set `isRefused` to have the MCP call refused the way auto mode's safety check refuses it. */
+  call?: { isRefused: boolean }
 }
 
 /**
@@ -49,6 +51,7 @@ function world(on: On, w: World = {}) {
   const found: Record<string, string> = { 'csharp-ls': `${HOME}\\.dotnet\\tools\\csharp-ls.exe`, ...w.found }
   mock.env(on, { OS: 'Windows_NT', USERPROFILE: HOME, ...w.env })
   mock.clock(on, { now: Date.parse('2026-10-19T12:00:00Z') })
+  mock.store(on, {})
   on('session.cwd', () => ({ value: CWD }) as never)
   on('settings.read', () => ({
     value: { enabledPlugins: { 'csharp-lsp@claude-plugins-official': true, 'pyright-lsp@claude-plugins-official': true, 'gopls-lsp@claude-plugins-official': true } },
@@ -67,6 +70,7 @@ function world(on: On, w: World = {}) {
   on('tool.list', () => ({ value: w.hasMcp ? [{ name: 'mcp__local_lsp__lsp_status', description: '', mcp: true }] : [] }) as never)
   on('mcp.call', (_$, e) => {
     if (!w.hasMcp || e.server !== 'local_lsp' || e.tool !== 'lsp_status') throw new Error('no such tool')
+    if (w.call?.isRefused) return { deny: 'The server-side auto mode classifier gave no verdict for mcp__local_lsp__lsp_status' } as never
     const servers = [{ id: 'local-powershell', extensions: ['.ps1', '.psm1', '.psd1'] }]
     return { value: { content: [{ type: 'text', text: JSON.stringify({ servers }) }], isError: false } } as never
   })
@@ -120,6 +124,32 @@ test('an MCP server with an lsp_status tool covers PowerShell', async ($, on) =>
   const pane = await $.ui.mount({ plugin: 'lsp-status', surface: 'desktop', component: 'Pane', requestId: 'lsp-status', props: PANE })
   expect((await pane.find({ type: 'Text', text: /MCP server$/ }))?.text).toBe('1 file · local-powershell through the local_lsp MCP server')
   expect((await pane.find({ type: 'Text', text: /^MCP only$/ }))?.props.color).toBe('suggestion')
+  await pane.unmount()
+})
+
+test('a refused MCP call falls back to the last answer and names the rule that lets it through', async ($, on) => {
+  const call = { isRefused: false }
+  world(on, { hasMcp: true, call })
+  await $.command.run({ command: 'lsp-status' } as never)
+  call.isRefused = true
+  expect(textOf(await $.command.run({ command: 'lsp-status' } as never))).toContain('- PowerShell: MCP only (local-powershell).')
+
+  const pane = await $.ui.mount({ plugin: 'lsp-status', surface: 'desktop', component: 'Pane', requestId: 'lsp-status', props: PANE })
+  const line = await pane.find({ type: 'Text', text: /^MCP server local_lsp/ })
+  expect(line?.text).toMatch(/^MCP server local_lsp: this scan's call failed \(.*classifier gave no verdict.*\), so its last answer stands, 1 language server\./)
+  expect(line?.text).toMatch(/add mcp__local_lsp__lsp_status to permissions\.allow in your settings\.$/)
+  expect(line?.props.color).toBeUndefined()
+  await pane.unmount()
+})
+
+test('a refused MCP call with no saved answer says so', async ($, on) => {
+  world(on, { hasMcp: true, call: { isRefused: true } })
+  expect(textOf(await $.command.run({ command: 'lsp-status' } as never))).toContain('- No plugin or MCP server covers PowerShell.')
+
+  const pane = await $.ui.mount({ plugin: 'lsp-status', surface: 'terminal', component: 'Pane', requestId: 'lsp-status', props: PANE })
+  const line = await pane.find({ type: 'Text', text: /^MCP server local_lsp/ })
+  expect(line?.text).toMatch(/^MCP server local_lsp gave no language servers: .*classifier gave no verdict/)
+  expect(line?.props.color).toBe('warning')
   await pane.unmount()
 })
 

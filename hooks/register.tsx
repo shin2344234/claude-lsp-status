@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, FsEntry, Register } from 'claude-code'
 
-import type { Probe, Report, Row } from '../types'
+import type { McpCheck, Probe, Report, Row } from '../types'
 import { LABEL, LANGS, baseName, coverage, firstPath, fits, fixRequest, headline, mcpServersOf, pick, rows, serversOf, summary, tally, unplaced } from './scan'
 import type { Server } from './scan'
 
@@ -75,7 +75,8 @@ async function serversIn($: EngineInterface, dir: string, join: (...p: string[])
 async function mcpServers($: EngineInterface, globalConfig: string, cwd: string, join: (...p: string[]) => string) {
   const names = new Map<string, string>()
   const note = (name: string) => names.set(name.replace(/[^a-z0-9]/gi, '_').toLowerCase(), name)
-  for (const t of await $.tool.list().catch(() => [])) {
+  const tools = await $.tool.list().catch(() => [])
+  for (const t of tools) {
     const m = /^mcp__(.+)__lsp_status$/.exec(t.name)
     if (m) note(m[1]!)
   }
@@ -85,16 +86,46 @@ async function mcpServers($: EngineInterface, globalConfig: string, cwd: string,
   const local = await json<McpConfig>($, join(cwd, '.mcp.json'))
   for (const c of [global, project, local]) for (const name of Object.keys(c?.mcpServers ?? {})) if (/lsp/i.test(name)) note(name)
 
-  const out: Server[] = []
+  const servers: Server[] = []
+  const checks: McpCheck[] = []
   for (const name of names.values()) {
-    // A server that never answers costs ten seconds, not the scan.
-    const answer = await Promise.race([$.mcp.call(name, 'lsp_status').catch(() => undefined), $.clock.sleep(10_000).then(() => undefined)])
-    const block = answer && !answer.isError ? (answer.content.find(c => c.type === 'text') as { text?: string } | undefined) : undefined
-    try {
-      out.push(...mcpServersOf(name, answer?.structuredContent ?? JSON.parse(block?.text ?? 'null')))
-    } catch {}
+    let problem: string | undefined
+    // A server that never answers costs ten seconds, not the scan. A sleep that fails waits forever, so the call decides.
+    const answer = await Promise.race([
+      $.mcp.call(name, 'lsp_status').catch((err: unknown) => {
+        problem = (err instanceof Error ? err.message : String(err)).split('\n')[0]!.slice(0, 160)
+        return undefined
+      }),
+      $.clock.sleep(10_000).then(
+        () => ((problem ??= 'no answer within 10 seconds'), undefined),
+        () => new Promise<undefined>(() => {}),
+      ),
+    ])
+    const text = (answer?.content.find(c => c.type === 'text') as { text?: string } | undefined)?.text
+    let parsed: unknown
+    if (answer?.isError) problem = text?.split('\n')[0]?.slice(0, 160) || 'its lsp_status tool reported an error'
+    else if (answer) {
+      try {
+        parsed = answer.structuredContent ?? JSON.parse(text ?? 'null')
+      } catch {}
+      if (!mcpServersOf(name, parsed).length) problem = 'its lsp_status answer was not a list of servers'
+    }
+
+    // A server's language list rarely changes, so its last good answer stands in when a call is
+    // refused or times out. In auto mode the safety check can refuse a call it doesn't rule on.
+    const key = `mcp:${name}`
+    if (!problem) await $.store.set(key, { at: await $.clock.now(), answer: parsed }).catch(() => {})
+    const saved = problem ? ((await $.store.get(key).catch(() => undefined)) as { at?: number; answer?: unknown } | undefined) : undefined
+    const found = mcpServersOf(name, problem ? saved?.answer : parsed)
+    servers.push(...found)
+    checks.push({
+      server: name,
+      servers: found.length,
+      ...(problem && { problem }),
+      ...(problem && found.length && saved?.at !== undefined && { savedAt: saved.at }),
+    })
   }
-  return out
+  return { servers, checks }
 }
 
 /**
@@ -162,8 +193,9 @@ async function gatherServers($: EngineInterface, cwd: string, join: (...p: strin
     for (const e of await $.fs.list(root).catch(() => []))
       if (e.kind === 'dir') await fromFolder(join(root, e.name), 'skills-dir', id => enabled[id] !== false)
 
-  servers.push(...(await mcpServers($, custom ? join(config, '.claude.json') : join(home, '.claude.json'), cwd, join)))
-  return { servers, hinted }
+  const mcp = await mcpServers($, custom ? join(config, '.claude.json') : join(home, '.claude.json'), cwd, join)
+  servers.push(...mcp.servers)
+  return { servers, hinted, checks: mcp.checks }
 }
 
 /** Languages whose project file is in neither the folder's files nor, where the server looks up, a folder above. */
@@ -195,7 +227,7 @@ async function gather($: EngineInterface): Promise<Report> {
   const isWindows = (await $.env.get('OS')) === 'Windows_NT'
 
   const { files, via, isCapped } = await listFiles($, cwd, join)
-  const { servers, hinted } = await gatherServers($, cwd, join, isWindows)
+  const { servers, hinted, checks } = await gatherServers($, cwd, join, isWindows)
   const counts = tally(files, servers).langs
   const plugins = servers.filter(s => !s.isMcp)
 
@@ -218,11 +250,15 @@ async function gather($: EngineInterface): Promise<Report> {
     isCapped,
     rows: rows({ files, servers, hinted, binaries, missingProject, isWindows }),
     unplaced: unplaced(files, servers),
+    mcp: checks,
   }
 }
 
 // ponytail: module state, so a reload mid-scan starts a second one; both write the same report.
 let running: Promise<void> | null = null
+// MCP servers often finish connecting after the session starts, so a scan that found one silent
+// tries again 20 seconds later, three times at most.
+let retries = 0
 
 /** Scans the folder, unless a scan is already running, and updates the pane and the status line. */
 function scan($: EngineInterface): Promise<void> {
@@ -233,6 +269,11 @@ function scan($: EngineInterface): Promise<void> {
       await update($, report, () => r)
       const c = coverage(r.rows)
       $.ui.status(c.need ? `LSP ${c.covered}/${c.need}` : undefined)
+      if (!r.mcp.some(m => m.problem)) retries = 0
+      else if (retries < 3) {
+        retries++
+        $.clock.after(20_000, () => void scan($))
+      }
     } finally {
       await update($, scanning, () => false)
       running = null
@@ -264,6 +305,18 @@ async function test($: EngineInterface, row: Row, cwd: string) {
 async function askFix($: EngineInterface, r: Report) {
   const filled = await $.prompt.fill({ text: fixRequest(r.rows, r.folder) }).catch(() => undefined)
   if (!filled?.isFilled) $.ui.toast('Could not fill the prompt box. The fixes are listed in the LSP pane.')
+}
+
+/** What the pane says about one MCP server it asked, with the permission rule that stops a refusal. */
+function mcpLine(m: McpCheck): string {
+  const count = `${m.servers} language server${m.servers === 1 ? '' : 's'}`
+  if (!m.problem) return `MCP server ${m.server} reported ${count}.`
+  const rule = /classifier|refused|permission|denied/i.test(m.problem)
+    ? ` To let the call through, add mcp__${m.server.replace(/[^a-zA-Z0-9_-]/g, '_')}__lsp_status to permissions.allow in your settings.`
+    : ''
+  return m.savedAt
+    ? `MCP server ${m.server}: this scan's call failed (${m.problem}), so its last answer stands, ${count}.${rule}`
+    : `MCP server ${m.server} gave no language servers: ${m.problem}.${rule}`
 }
 
 const COLOR: Record<Row['status'], string | undefined> = {
@@ -336,8 +389,9 @@ export const register: Register = on => {
 
     const shown = r.rows.filter(x => x.status !== 'none')
     const none = r.rows.filter(x => x.status === 'none')
-    // A report kept from before the mod listed unknown file types has none.
+    // A report kept from before the mod listed unknown file types, or asked MCP servers, has none.
     const others = r.unplaced ?? []
+    const asked = r.mcp ?? []
     const hasFixes = shown.some(x => x.fix)
 
     const card = (row: Row) => {
@@ -406,6 +460,11 @@ export const register: Register = on => {
             Unknown file types with no server: {others.map(([ext, n]) => `${ext} (${n})`).join(', ')}.
           </Text>
         )}
+        {asked.map(m => (
+          <Text color={m.problem && !m.savedAt ? 'warning' : undefined} dimColor={!m.problem || Boolean(m.savedAt)} wrap="wrap">
+            {mcpLine(m)}
+          </Text>
+        ))}
         {hasFixes && (
           <Box marginTop={1}>
             <Button key="fix" label="Ask Claude to fix" variant="primary" onPress={() => askFix($, r)} />

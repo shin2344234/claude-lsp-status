@@ -32,7 +32,7 @@ Language servers come from every place Claude Code loads one, plus MCP servers:
 - plugins under `~/.claude/skills` and the project's `.claude/skills`
 - MCP servers with an `lsp_status` tool that answers `{ "servers": [{ "id": "...", "extensions": [".ext"] }] }`
 
-For the last one the mod asks every connected server that has the tool, plus any server in your MCP config with "lsp" in its name. It calls `lsp_status` and no other tool.
+For the last one the mod asks every connected server that has the tool, plus any server in your MCP config with "lsp" in its name. It calls `lsp_status` and no other tool. The call goes through Claude Code's permission check like any other tool call. In auto mode that check sometimes doesn't rule on it, and then the call is refused. The mod saves each server's last good answer and uses it when a call is refused or times out, and it tries again 20 seconds later, up to three times. A line at the bottom of the pane says what each MCP server answered. To keep the call away from the check entirely, add the tool to `permissions.allow` in `~/.claude/settings.json`, such as `"mcp__my_lsp_server__lsp_status"`.
 
 A file type counts as a language when the mod's own table names it or when any of those servers declares it. Data formats such as JSON and YAML show only once some server covers them. Any other type that isn't on the mod's list of non-code types (images, archives, lock files, engine assets and so on) goes in the unknown list.
 
@@ -44,7 +44,7 @@ The mod scans when the session starts, when you press Rescan or run `/lsp-status
 
 The pane reads plugin files and settings, not the running session. A plugin installed or enabled mid-session shows as ready before the LSP tool has loaded its server, so restart the session after a fix and press Test.
 
-MCP-only coverage is read-only, and the model reaches it through that MCP server's own tools, not the LSP tool.
+MCP-only coverage is read-only, and the model reaches it through that MCP server's own tools, not the LSP tool. Until one of a server's `lsp_status` calls gets through, the languages only it covers show as uncovered.
 
 The band shows one drawing. Another mod that draws its own band line without passing on what `next(e)` returns hides this item whenever it runs first. The fix in that mod is to call `next(e)` and put the result at the end of its own line.
 
@@ -80,7 +80,7 @@ claude plugin validate .
 claude plugin test .
 ```
 
-`scan.test.ts` covers the matching, each state, MCP-only coverage, file types that only a server declares, and the unknown list. `pane.test.tsx` runs the command against a made-up Windows machine and draws the pane and the band on the terminal and desktop surfaces. It covers an MCP server with `lsp_status`, plugins from `CLAUDE_CODE_PLUGIN_DIRS` and the skills folder, Test against a server that answers and one that fails, and the band item on its own, after another mod's line, and under a survey.
+`scan.test.ts` covers the matching, each state, MCP-only coverage, file types that only a server declares, and the unknown list. `pane.test.tsx` runs the command against a made-up Windows machine and draws the pane and the band on the terminal and desktop surfaces. It covers an MCP server with `lsp_status`, a refused call with and without a saved answer, plugins from `CLAUDE_CODE_PLUGIN_DIRS` and the skills folder, Test against a server that answers and one that fails, and the band item on its own, after another mod's line, and under a survey.
 
 ## License
 
