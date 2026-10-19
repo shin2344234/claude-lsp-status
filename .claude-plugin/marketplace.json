@@ -1,0 +1,14 @@
+{
+  "name": "lsp-status",
+  "owner": {
+    "name": "shin2344234"
+  },
+  "description": "The lsp-status mod for Claude Code",
+  "plugins": [
+    {
+      "name": "lsp-status",
+      "source": "./",
+      "description": "Checks the session folder's languages against your LSP plugins, plugin folders and MCP language servers, and shows what is missing"
+    }
+  ]
+}

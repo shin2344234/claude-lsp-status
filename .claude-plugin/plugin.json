@@ -1,0 +1,11 @@
+{
+  "name": "lsp-status",
+  "version": "0.1.0",
+  "description": "Checks the session folder's languages against your LSP plugins, plugin folders and MCP language servers, and shows what is missing",
+  "author": {
+    "name": "Seth"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/shin2344234/claude-lsp-status",
+  "types": "./types/index.d.ts"
+}
